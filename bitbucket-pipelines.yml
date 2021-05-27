@@ -1,0 +1,129 @@
+# If the container image node version changes here the .nvmrc file should also be updated
+image: node:12.22.1
+
+# The following variables are pulled from the bitbucket pipelines repository variables
+# BC_THEME_VARIATION
+# BC_STORE_URL
+# BC_ACCESS_TOKEN
+
+# You can add the following text flags to a commit message to change the deployment
+# DEPLOY_CONFIG - will bypass the stencil pull and the check for any git differences
+
+# Reference: https://developer.bigcommerce.com/stencil-docs/deploying-a-theme/bundling-and-pushing
+
+deploy: &deploy
+  - step:
+      name: Build/Package Bundle Theme for Deployment and Deploy
+      caches:
+        - node
+      script:
+        # Update and Install jq
+        - apt-get -y update
+        - apt-get -y install jq
+
+        # Get the current commit message
+        # Display only the entire commit message from the most recent commit
+        # %B raw body (unwrapped subject and body)
+        - COMMIT_MESSAGE=$(git log -n 1 --pretty=format:"%B")
+        # Extract the version from the config.json file
+        - BC_THEME_VERSION=$(cat config.json | jq -r '.version')
+        # Extract the name from the config.json file
+        - BC_THEME_NAME=$(cat config.json | jq -r '.name')
+        # The confg.json name has to be unique when being pushed to BigCommerce
+        # If it matches an existing theme name BigCommerce will create a new theme
+        # with the name plus " (1)" to indicate that it's a copy of the same name
+        - BC_THEME_BUNDLE_NAME="${BITBUCKET_REPO_SLUG}_${BITBUCKET_BRANCH}_${BITBUCKET_BUILD_NUMBER}"
+        - BC_THEME_BUNDLE_VERSION="${BITBUCKET_BUILD_NUMBER}"
+
+        # Clean install node_modules
+        - npm ci
+        # Remove old .stencil config files
+        - rm -rf .stencil
+        # Check Stencil version
+        - echo "Stencil Version" && npx stencil --version
+        # Initialize Stencil
+        - >-
+          npx stencil init --url "${BC_STORE_URL}" --token "${BC_ACCESS_TOKEN}" --port "3000"
+        # Modify the commands below to build your repository.
+        # Alternative using jq to create JSON file
+        # echo "{}" | jq -c \
+        #   --arg BC_STORE_URL "${BC_STORE_URL}" \
+        #   --arg BC_ACCESS_TOKEN "${BC_ACCESS_TOKEN}" \
+        #   '.normalStoreUrl = $BC_STORE_URL | .accessToken = $BC_ACCESS_TOKEN' \
+        #   > secrets.stencil.json
+
+        # If the DEPLOY_CONFIG flag is not found in the commit message then
+        # run stencil pull to get the currently active theme config file and overwrite local copy
+        - >-
+          [[ $(echo "${COMMIT_MESSAGE}" | grep "DEPLOY_CONFIG" | wc -l | tr -d ' ') -lt 1 ]] \
+            && npx stencil pull
+
+        # Reset the name and version of config.json to what was in the repo
+        # read config.json and use jq with some arguments passed in to change
+        # a couple values and output the changes to updated_config.json
+        # and then replace config.json with updated_config.json
+        - >-
+          cat config.json | jq -j \
+            --arg BC_THEME_NAME "${BC_THEME_NAME}" \
+            --arg BC_THEME_VERSION "${BC_THEME_VERSION}" \
+            '.name = $BC_THEME_NAME | .version = $BC_THEME_VERSION' \
+            > updated_config.json
+        - mv updated_config.json config.json
+        # If DEPLOY_CONFIG is not defined then test to see if there are any differences after the stencil pull
+        # If there are any changes besides the name and version in config.json those changes should either be committed
+        # to the repo first or to force a deployment so that the repo config.json overwrites the one currently on the site.
+        - >-
+          [[ $(echo "${COMMIT_MESSAGE}" | grep "DEPLOY_CONFIG" | wc -l | tr -d ' ') -lt 1 ]] \
+            && git diff --no-ext-diff
+
+        # Set the new bundle name and version in the config.json file
+        - >-
+          cat config.json | jq -j \
+            --arg BC_THEME_BUNDLE_NAME "${BC_THEME_BUNDLE_NAME}" \
+            --arg BC_THEME_BUNDLE_VERSION "${BC_THEME_BUNDLE_VERSION}" \
+            '.name = $BC_THEME_BUNDLE_NAME | .version = $BC_THEME_BUNDLE_VERSION' \
+            > updated_config.json
+        - mv updated_config.json config.json
+
+        # Create a theme bundle artifact (stencil-bundle.zip) to send to the site and store in Bitbucket Artifacts
+        - npx stencil bundle --name stencil-bundle
+
+        # Push stencil bundle to site
+        # This will create a new theme on the BigCommerce account from this bundle
+        # You can only have 20 themes, so the -d flag is used to delete oldest private theme if upload limit reached
+        # Only the deployments from the master branch will be activated once the bundle is pushed
+        - >-
+          [[ "${BITBUCKET_BRANCH}" = "develop" ]] && npx stencil push -d -f stencil-bundle.zip
+        - >-
+          [[ "${BITBUCKET_BRANCH}" = "master" ]] && npx stencil push -a $BC_THEME_VARIATION -d -f stencil-bundle.zip
+
+        # Ending with a successful command that includes some debugging info
+        - |
+          echo "
+          Theme Deployment Complete
+          ---------------------------------
+          BITBUCKET_REPO_SLUG: ${BITBUCKET_REPO_SLUG}
+          BITBUCKET_BRANCH: ${BITBUCKET_BRANCH}
+          BITBUCKET_BUILD_NUMBER: ${BITBUCKET_BUILD_NUMBER}
+          BC_STORE_URL: ${BC_STORE_URL}
+          BC_THEME_VARIATION: ${BC_THEME_VARIATION}
+          BC_THEME_VERSION: ${BC_THEME_VERSION}
+          BC_THEME_NAME: ${BC_THEME_NAME}
+          BC_THEME_BUNDLE_NAME: ${BC_THEME_BUNDLE_NAME}
+          BC_THEME_BUNDLE_VERSION: ${BC_THEME_BUNDLE_VERSION}
+          COMMIT_MESSAGE: ${COMMIT_MESSAGE}
+          "
+
+      artifacts:
+        # This allows the actual zip file to be kept and downloaded from the pipeline
+        # details for up to 14 days after the deployment
+        - stencil-bundle.zip
+
+pipelines:
+  # default:
+  # - <<: *deploy
+  branches:
+    master:
+      - <<: *deploy
+    develop:
+      - <<: *deploy
